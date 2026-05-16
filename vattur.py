@@ -1,5 +1,3 @@
-# SectorBot by Fatih Mutlu
-# A Discord bot made with Python and passion!
 import discord
 from discord.ext import commands, tasks
 import requests
@@ -7,7 +5,7 @@ import logging
 import os
 from telegram import Bot
 import asyncio
-import cloudscraper
+from curl_cffi import requests as curl_requests
 import json
 from logging.handlers import TimedRotatingFileHandler
 import telegram
@@ -122,34 +120,36 @@ class RosterClient:
         self.api_key = api_key
         self.api_url = "https://core.vateud.net/api/facility/roster"
         self.logger = logging.getLogger()
+        self._session = curl_requests.Session(impersonate="chrome131")
         
     async def get_roster(self) -> dict:
         try:
             self.logger.info("=== VATEUD API Request ===")
-            scraper = cloudscraper.create_scraper(
-                browser={
-                    'browser': 'chrome',
-                    'platform': 'linux',
-                    'desktop': True
-                }
-            )
             
             headers = {
                 'Accept': 'application/json',
                 'X-API-KEY': self.api_key,
-                'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36'
             }
             
-            # Log API request without sensitive data
-            self.logger.info(f"Making request to VATEUD API")
+            self.logger.info("Making request to VATEUD API")
             
-            response = scraper.get(self.api_url, headers=headers)
+            response = await asyncio.to_thread(
+                self._session.get,
+                self.api_url,
+                headers=headers,
+                timeout=30,
+            )
             
-            # Log API response
             self.logger.info(f"Response Status: {response.status_code}")
             
             if response.status_code != 200:
-                self.logger.error(f"API Response Error: {response.text[:500]}")
+                if "Just a moment" in response.text:
+                    self.logger.error(
+                        "VATEUD API blocked by Cloudflare (403). "
+                        "Update curl_cffi or contact VATEUD to whitelist this server."
+                    )
+                else:
+                    self.logger.error(f"API Response Error: {response.text[:500]}")
                 raise Exception(f"API request failed with status {response.status_code}")
                 
             data = response.json()
@@ -172,7 +172,7 @@ class RosterClient:
 
 class VATTurkBot(commands.Bot):
     def __init__(self, config):
-        self.CONTROLLER_ROLE_ID = EXAMPLEID  # "Online ATC" role
+        self.CONTROLLER_ROLE_ID = 1234567890123456789  # "Online ATC" role. !!!YOU HAVE TO UPDATE THIS BASED ON YOUR DISCORD SERVER'S ONLINE ROLE!!!
         self.role_error_logged = {}
         self.startup_complete = False
         
@@ -345,7 +345,7 @@ class VATTurkBot(commands.Bot):
         warning_msg = (f"⚠️ **ROGUE CONNECTION DETECTED**\n"
                       f"Controller: {callsign} ({name})\n"
                       f"CID: {cid}\n"
-                      f"This controller is not in the vACC roster!")
+                      f"This controller is not in the TRvACC roster!")
         
         # Log the rogue controller detection
         logger.warning(f"Rogue controller detected: {callsign} ({cid})")
