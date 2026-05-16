@@ -1,0 +1,28 @@
+# See INSTALL.md — "Not in the repo (you create these locally)"
+
+# Virtual environment (python3.11 -m venv .venv)
+.venv/
+venv/
+
+# Legacy: venv created in project root (bin/, lib/, include/ at repo root)
+bin/
+lib/
+lib64/
+include/
+pyvenv.cfg
+
+# Secrets (copy from vattur.env.example → vattur.env)
+vattur.env
+
+# Application logs (written at runtime in WorkingDirectory)
+vattur.log
+vattur.log.*
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
