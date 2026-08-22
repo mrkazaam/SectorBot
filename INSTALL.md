@@ -281,7 +281,9 @@ sudo systemctl start vattur
 | No Telegram messages | Bot added to channel; correct `TELEGRAM_CHANNEL_ID` |
 | No activity check messages | `DISCORD_ACTIVITY_CHANNEL_ID` set; bot can **Send Messages** in that channel |
 | Activity check skips / already ran | `activity_check_state.json` marks the month; use `/activitycheck` (owner) to force |
+| False rogue alerts for everyone | VATEUD roster failed to load (check logs for `401` / invalid API key). Rogue checks are skipped until a roster load succeeds |
 | VATEUD 403 / “Just a moment” | Cloudflare; upgrade `curl_cffi` or contact VATEUD about your server IP |
+| VATEUD 401 / Invalid API key | Refresh `VATEUD_API_KEY` from VATEUD Core and restart the service |
 | METAR/TAF errors | Airport code or `CHECKWX_API_KEY` |
 
 ---

@@ -218,8 +218,12 @@ class RosterClient:
         self.api_url = "https://core.vateud.net/api/facility/roster"
         self.logger = logging.getLogger()
         self._session = curl_requests.Session(impersonate="chrome131")
+        self.last_status_code = None
+        self.last_error = None
         
     async def get_roster(self) -> dict:
+        self.last_status_code = None
+        self.last_error = None
         try:
             self.logger.info("=== VATEUD API Request ===")
             
@@ -237,20 +241,29 @@ class RosterClient:
                 timeout=30,
             )
             
+            self.last_status_code = response.status_code
             self.logger.info(f"Response Status: {response.status_code}")
             
             if response.status_code != 200:
-                if "Just a moment" in response.text:
-                    self.logger.error(
+                if response.status_code == 401:
+                    self.last_error = (
+                        "Invalid API Key provided. Please check VATEUD Core for your vACC's API Key"
+                    )
+                    self.logger.error(f"API Response Error: {self.last_error}")
+                elif "Just a moment" in response.text:
+                    self.last_error = (
                         "VATEUD API blocked by Cloudflare (403). "
                         "Update curl_cffi or contact VATEUD to whitelist this server."
                     )
+                    self.logger.error(self.last_error)
                 else:
-                    self.logger.error(f"API Response Error: {response.text[:500]}")
+                    self.last_error = response.text[:500]
+                    self.logger.error(f"API Response Error: {self.last_error}")
                 raise Exception(f"API request failed with status {response.status_code}")
                 
             data = response.json()
             if not data.get('success'):
+                self.last_error = str(data)
                 self.logger.error(f"API Error Response: {data}")
                 raise Exception("API returned error status")
             
@@ -265,6 +278,8 @@ class RosterClient:
             
         except Exception as e:
             self.logger.error(f"API Error: {str(e)}")
+            if self.last_error is None:
+                self.last_error = str(e)
             return None
 
 class VATTurkBot(commands.Bot):
@@ -294,6 +309,7 @@ class VATTurkBot(commands.Bot):
         self.callsign_status = {callsign: None for callsign in self.callsigns}
         self.trvac_roster = set()
         self.trvac_controllers = set()
+        self.roster_ready = False
         self.last_roster_update = None
         self.roster_update_task = None
         self.first_check = True
@@ -302,6 +318,8 @@ class VATTurkBot(commands.Bot):
         self.activity_window_months = 6
         self.activity_state_file = Path("activity_check_state.json")
         self.activity_check_running = False
+        # In-memory only: one 401 notice per unbroken failure streak (resets on restart / recovery)
+        self.vateud_401_noticed = False
         
         # Register commands
         self.setup_commands()
@@ -360,13 +378,30 @@ class VATTurkBot(commands.Bot):
         except Exception as e:
             logger.error(f"Failed to send notification: {str(e)}", exc_info=True)
 
+    async def notify_vateud_401(self):
+        """Notify Discord + Telegram once per 401 failure streak (not per controller event)."""
+        if self.vateud_401_noticed:
+            return
+        self.vateud_401_noticed = True
+        detail = self.roster_client.last_error or (
+            "Invalid API Key provided. Please check VATEUD Core for your vACC's API Key"
+        )
+        if not self.is_ready():
+            await self.wait_until_ready()
+        await self.send_notification(
+            f"⚠️ **VATEUD API 401**\n{detail}\n"
+            f"Roster updates and rogue checks are paused until `VATEUD_API_KEY` is fixed."
+        )
+
     async def update_roster(self):
         try:
             logger.info("Starting roster update...")
             roster_data = await self.roster_client.get_roster()
             
             if not roster_data:
-                logger.error("Failed to fetch roster data")
+                logger.error("Failed to fetch roster data — rogue checks paused until roster is available")
+                if self.roster_client.last_status_code == 401:
+                    await self.notify_vateud_401()
                 return False
                 
             staff_cids = set()
@@ -379,7 +414,10 @@ class VATTurkBot(commands.Bot):
             controller_cids = {str(cid) for cid in roster_data.get('controllers', [])}
             self.trvac_controllers = controller_cids
             self.trvac_roster = staff_cids | controller_cids
+            self.roster_ready = True
             self.last_roster_update = asyncio.get_event_loop().time()
+            # Allow a fresh notice if the key breaks again later this session
+            self.vateud_401_noticed = False
             
             logger.info(
                 f"Roster update completed: {len(self.trvac_roster)} total members "
@@ -392,15 +430,26 @@ class VATTurkBot(commands.Bot):
             return False
 
     async def schedule_roster_updates(self):
-        """Schedule periodic roster updates"""
+        """Load roster before online monitoring, then refresh periodically."""
+        await self.wait_until_ready()
+        first = True
         while True:
             try:
-                await self.update_roster()
-                # Wait for 1 hour before next update
-                await asyncio.sleep(3600)  # 3600 seconds = 1 hour
+                ok = await self.update_roster()
+                if first:
+                    first = False
+                    # Start VATSIM online alerts only after the first roster attempt
+                    # so a startup 401 notice is not mixed into connection logs.
+                    if not self.check_vatsim.is_running():
+                        self.check_vatsim.start()
+                await asyncio.sleep(60 if not ok else 3600)
             except Exception as e:
                 logger.error(f"Error in roster update schedule: {e}")
-                await asyncio.sleep(60)  # Wait 1 minute before retrying if there's an error
+                if first:
+                    first = False
+                    if not self.check_vatsim.is_running():
+                        self.check_vatsim.start()
+                await asyncio.sleep(60)
 
     def _subtract_months(self, dt: datetime, months: int) -> datetime:
         year = dt.year
@@ -577,7 +626,11 @@ class VATTurkBot(commands.Bot):
                 if self.first_check or previous_status != "online":
                     logger.info(f"Status change detected for {callsign}")
                     await self.notify_controller_status(callsign, name, cid, "online")
-                    if cid not in self.trvac_roster:
+                    if not self.roster_ready:
+                        logger.warning(
+                            f"Skipping rogue check for {callsign} ({cid}) — VATEUD roster not loaded yet"
+                        )
+                    elif cid not in self.trvac_roster:
                         await self.notify_rogue_controller(callsign, name, cid)
                 
                 self.callsign_status[callsign] = "online"
@@ -775,10 +828,8 @@ class VATTurkBot(commands.Bot):
         # Start all tasks
         logger.info("Starting bot tasks...")
         self.check_controller_status.start()
-        self.check_vatsim.start()
         self.monthly_activity_check_loop.start()
-        
-        # Create task for roster updates
+        # Roster bootstrap starts check_vatsim after the first VATEUD attempt
         self.loop.create_task(self.schedule_roster_updates())
         
         logger.info("All tasks started successfully")
