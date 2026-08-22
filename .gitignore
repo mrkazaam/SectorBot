@@ -7,6 +7,7 @@ venv/
 # Legacy: venv created in project root (bin/, lib/, include/ at repo root)
 bin/
 lib/
+lib64
 lib64/
 include/
 pyvenv.cfg
@@ -17,6 +18,9 @@ vattur.env
 # Application logs (written at runtime in WorkingDirectory)
 vattur.log
 vattur.log.*
+
+# Monthly activity check marker (written at runtime)
+activity_check_state.json
 
 # Python bytecode
 __pycache__/

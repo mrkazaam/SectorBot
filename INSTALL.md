@@ -1,6 +1,6 @@
-# Sector Bot — Installation Guide
+# VATTur — Installation Guide
 
-Sector Bot is a Discord bot that monitors VATSIM controller activity, assigns an “Online ATC” role, sends alerts to Discord and Telegram, and provides slash commands for METAR, TAF, and status. This project has coded on Ubuntu 24.04 LTS Noble and not tested on another enviroment.
+VATTur is a Discord bot that monitors VATSIM controller activity, assigns an “Online ATC” role, sends alerts to Discord and Telegram, runs a monthly roster activity check, and provides slash commands for METAR, TAF, and status.
 
 This guide is for **anyone cloning the repository from GitHub**. The repo contains source code and configuration templates only. You create your own Python virtual environment, secrets file, and logs on your machine—they are **not** part of the repository.
 
@@ -21,6 +21,7 @@ This guide is for **anyone cloning the repository from GitHub**. The repo contai
 - `.venv/` — Python virtual environment (`bin`, `lib`, `include`, etc.)
 - `vattur.env` — API tokens and IDs (never commit)
 - `vattur.log` — runtime logs
+- `activity_check_state.json` — written at runtime so the monthly activity check runs once per month
 
 ---
 
@@ -46,6 +47,8 @@ This guide is for **anyone cloning the repository from GitHub**. The repo contai
 git clone https://github.com/mrkazaam/SectorBot.git
 cd SectorBot
 ```
+
+The rest of this guide assumes the project directory is wherever you cloned it (called `$PROJECT` below).
 
 ---
 
@@ -73,7 +76,7 @@ python3.11 --version   # or: python3 --version
 From the project directory, create a local venv named `.venv` (this folder stays on your machine and is ignored by git):
 
 ```bash
-cd "SectorBot"
+cd "$PROJECT"
 python3.11 -m venv .venv
 ```
 
@@ -89,6 +92,8 @@ Install dependencies:
 .venv/bin/pip install --upgrade pip
 .venv/bin/pip install -r requirements.txt
 ```
+
+You do **not** need to commit or copy `bin`, `lib`, or `include` from another machine. Every installer runs these commands once on their own host.
 
 ---
 
@@ -110,7 +115,8 @@ Edit `vattur.env` and fill in every value:
 | `DISCORD_BOT_TOKEN` | Bot token from Discord Developer Portal |
 | `DISCORD_GUILD_ID` | Your Discord server ID (Developer Mode → right‑click server → Copy ID) |
 | `DISCORD_CHANNEL_ID` | Channel ID for VATSIM / rogue alerts |
-| `DISCORD_OWNER_ID` | Your Discord user ID (for `/shutdown`) |
+| `DISCORD_ACTIVITY_CHANNEL_ID` | Channel ID for monthly activity check announcements (see below) |
+| `DISCORD_OWNER_ID` | Your Discord user ID (for `/shutdown` and `/activitycheck`) |
 | `TELEGRAM_TOKEN` | From [@BotFather](https://t.me/BotFather) |
 | `TELEGRAM_CHANNEL_ID` | Telegram channel/chat ID (often `-100…`) |
 | `CHECKWX_API_KEY` | From [checkwx.com](https://www.checkwx.com/) |
@@ -120,9 +126,28 @@ Edit `vattur.env` and fill in every value:
 
 ### Callsigns
 
-Edit `callsigns.txt`: one VATSIM callsign per line (e.g. `LTAC_TWR`). Use the list appropriate for **your** airspace, not necessarily the sample in the repo.
+Edit `callsigns.txt`: one VATSIM callsign per line (e.g. `LTAC_TWR`). Use the list appropriate for **your** airspace, not necessarily the sample in the repo. The same list is used for online monitoring and for counting hours in the monthly activity check.
 
-### Controller role ID (for ex. "Online ATC")
+### Monthly activity check
+
+On the **1st of each month** (Europe/Istanbul), the bot:
+
+1. Loads controller CIDs from the VATEUD facility roster.
+2. For each CID, queries VATSIM API v2 ATC history (`/v2/members/{cid}/atc`).
+3. Counts hours only on callsigns listed in `callsigns.txt`.
+4. Fails anyone with **less than 5 hours** in a **rolling 6-month** window.
+
+Announcements go **only** to `DISCORD_ACTIVITY_CHANNEL_ID` (not the main alert channel or Telegram):
+
+- `Activity check started.`
+- `CID XXXXXX activity failed. User connected X.XX hours in 6 months, which is below required.` (one message per failure)
+- `Activity check finished.`
+
+VATSIM API v2 requests are limited to **fewer than 10 per minute** (9 max), so a full roster run can take a while.
+
+A local `activity_check_state.json` file prevents a second automatic run if the bot restarts on the 1st. Owners can force a run anytime with `/activitycheck`.
+
+### Controller role ID
 
 In `vattur.py`, set `CONTROLLER_ROLE_ID` to your Discord **“Online ATC”** (or equivalent) role ID:
 
@@ -139,7 +164,7 @@ Enable Developer Mode → **Server Settings → Roles** → right‑click the ro
 Load secrets and start the bot:
 
 ```bash
-cd "SectorBot"
+cd "$PROJECT"
 set -a && source vattur.env && set +a
 .venv/bin/python vattur.py
 ```
@@ -184,7 +209,7 @@ Create `/etc/systemd/system/vattur.service`:
 
 ```ini
 [Unit]
-Description=SectorBot Discord Bot
+Description=VATTur Discord Bot
 After=network-online.target
 Wants=network-online.target
 
@@ -225,9 +250,10 @@ tail -f /opt/vattur/app/vattur.log
 ## 7. Verify everything works
 
 1. Bot shows **online** in Discord.
-2. Slash commands `/metar`, `/taf`, `/status` appear in your server (may take up to a minute after first start).
+2. Slash commands `/metar`, `/taf`, `/status`, `/activitycheck` appear in your server (may take up to a minute after first start).
 3. When a listed callsign connects on VATSIM, messages appear in your Discord channel and Telegram.
 4. Members with a CID in their nickname get the controller role while online on a tracked callsign (see `extract_cid` in `vattur.py` for nickname formats).
+5. Set `DISCORD_ACTIVITY_CHANNEL_ID`, then as owner run `/activitycheck` — you should see start / fail / finished messages in that channel.
 
 ---
 
@@ -253,6 +279,8 @@ sudo systemctl start vattur
 | No slash commands | Wrong guild ID; invite URL must include `applications.commands` |
 | Roles not added/removed | Bot role position; **Manage Roles** permission |
 | No Telegram messages | Bot added to channel; correct `TELEGRAM_CHANNEL_ID` |
+| No activity check messages | `DISCORD_ACTIVITY_CHANNEL_ID` set; bot can **Send Messages** in that channel |
+| Activity check skips / already ran | `activity_check_state.json` marks the month; use `/activitycheck` (owner) to force |
 | VATEUD 403 / “Just a moment” | Cloudflare; upgrade `curl_cffi` or contact VATEUD about your server IP |
 | METAR/TAF errors | Airport code or `CHECKWX_API_KEY` |
 

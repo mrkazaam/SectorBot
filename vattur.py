@@ -9,6 +9,10 @@ from curl_cffi import requests as curl_requests
 import json
 from logging.handlers import TimedRotatingFileHandler
 import telegram
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+from pathlib import Path
+import time
 
 # Configure logging with rotation
 def setup_logging():
@@ -48,6 +52,7 @@ class Config:
         self.TELEGRAM_CHANNEL_ID = os.getenv('TELEGRAM_CHANNEL_ID')
         self.GUILD_ID = os.getenv('DISCORD_GUILD_ID')
         self.CHANNEL_ID = os.getenv('DISCORD_CHANNEL_ID')
+        self.ACTIVITY_CHANNEL_ID = os.getenv('DISCORD_ACTIVITY_CHANNEL_ID')
         self.CHECKWX_API_KEY = os.getenv('CHECKWX_API_KEY')
         self.OWNER_ID = int(os.getenv('DISCORD_OWNER_ID'))
         self.VATEUD_API_KEY = os.getenv('VATEUD_API_KEY')
@@ -79,8 +84,15 @@ class WeatherAPI:
             return {"success": False, "error": str(e)}
 
 class VatsimClient:
+    # Stay under 10 VATSIM API v2 requests per minute
+    V2_MAX_REQUESTS_PER_MINUTE = 9
+    V2_WINDOW_SECONDS = 60.0
+
     def __init__(self):
         self.api_url = "https://data.vatsim.net/v3/vatsim-data.json"
+        self.atc_history_url = "https://api.vatsim.net/v2/members/{cid}/atc"
+        self._v2_request_times = []
+        self._v2_lock = asyncio.Lock()
         
     async def get_controllers(self) -> list:
         try:
@@ -114,6 +126,91 @@ class VatsimClient:
         except Exception as e:
             logger.error(f"Unexpected error in get_controllers: {e}")
             return []
+
+    @staticmethod
+    def parse_session_time(value: str):
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            logger.error(f"Failed to parse session timestamp: {value}")
+            return None
+
+    async def _wait_for_v2_slot(self):
+        """Block until a VATSIM API v2 request is allowed (< 10 per minute)."""
+        while True:
+            async with self._v2_lock:
+                now = time.monotonic()
+                cutoff = now - self.V2_WINDOW_SECONDS
+                self._v2_request_times = [t for t in self._v2_request_times if t > cutoff]
+                if len(self._v2_request_times) < self.V2_MAX_REQUESTS_PER_MINUTE:
+                    self._v2_request_times.append(now)
+                    return
+                wait = self.V2_WINDOW_SECONDS - (now - self._v2_request_times[0]) + 0.05
+            logger.info(f"VATSIM API v2 rate limit reached, waiting {wait:.1f}s")
+            await asyncio.sleep(wait)
+
+    async def get_atc_sessions_since(self, cid: str, since: datetime) -> list:
+        """Fetch ATC sessions for a CID until sessions are older than `since`."""
+        sessions = []
+        limit = 100
+        offset = 0
+        since_utc = since.astimezone(timezone.utc)
+
+        while True:
+            url = self.atc_history_url.format(cid=cid)
+            params = {"limit": limit, "offset": offset}
+            await self._wait_for_v2_slot()
+
+            def _get():
+                return requests.get(url, params=params, timeout=30)
+
+            try:
+                response = await asyncio.to_thread(_get)
+            except requests.RequestException as e:
+                logger.error(f"Failed to fetch ATC history for CID {cid}: {e}")
+                break
+
+            if response.status_code == 429:
+                retry_after = int(response.headers.get("Retry-After", "60"))
+                logger.warning(f"VATSIM ATC API rate limited for CID {cid}, waiting {retry_after}s")
+                await asyncio.sleep(retry_after)
+                continue
+
+            if response.status_code == 404:
+                logger.debug(f"No VATSIM ATC history for CID {cid}")
+                break
+
+            if response.status_code != 200:
+                logger.warning(f"VATSIM ATC API {response.status_code} for CID {cid}")
+                break
+
+            try:
+                payload = response.json()
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to parse ATC history for CID {cid}: {e}")
+                break
+
+            items = payload.get("items") or []
+            if not items:
+                break
+
+            reached_end = False
+            for item in items:
+                connection = item.get("connection_id") or {}
+                start = self.parse_session_time(connection.get("start"))
+                if start and start < since_utc:
+                    reached_end = True
+                    break
+                sessions.append(item)
+
+            if reached_end or len(items) < limit:
+                break
+
+            offset += limit
+
+        return sessions
 
 class RosterClient:
     def __init__(self, api_key):
@@ -172,7 +269,7 @@ class RosterClient:
 
 class VATTurkBot(commands.Bot):
     def __init__(self, config):
-        self.CONTROLLER_ROLE_ID = 1234567890123456789  # "Online ATC" role. !!!YOU HAVE TO UPDATE THIS BASED ON YOUR DISCORD SERVER'S ONLINE ROLE!!!
+        self.CONTROLLER_ROLE_ID = 1326978814131048489  # "Online ATC" role
         self.role_error_logged = {}
         self.startup_complete = False
         
@@ -193,11 +290,18 @@ class VATTurkBot(commands.Bot):
         
         # Initialize tracking variables
         self.callsigns = self.load_callsigns('callsigns.txt')
+        self.callsign_set = {cs.upper() for cs in self.callsigns}
         self.callsign_status = {callsign: None for callsign in self.callsigns}
         self.trvac_roster = set()
+        self.trvac_controllers = set()
         self.last_roster_update = None
         self.roster_update_task = None
         self.first_check = True
+        self.activity_timezone = ZoneInfo("Europe/Istanbul")
+        self.activity_min_hours = 5.0
+        self.activity_window_months = 6
+        self.activity_state_file = Path("activity_check_state.json")
+        self.activity_check_running = False
         
         # Register commands
         self.setup_commands()
@@ -273,10 +377,14 @@ class VATTurkBot(commands.Bot):
                     staff_cids.add(str(staff_group['cid']))
             
             controller_cids = {str(cid) for cid in roster_data.get('controllers', [])}
+            self.trvac_controllers = controller_cids
             self.trvac_roster = staff_cids | controller_cids
             self.last_roster_update = asyncio.get_event_loop().time()
             
-            logger.info(f"Roster update completed: {len(self.trvac_roster)} total members")
+            logger.info(
+                f"Roster update completed: {len(self.trvac_roster)} total members "
+                f"({len(self.trvac_controllers)} controllers)"
+            )
             return True
             
         except Exception as e:
@@ -293,6 +401,159 @@ class VATTurkBot(commands.Bot):
             except Exception as e:
                 logger.error(f"Error in roster update schedule: {e}")
                 await asyncio.sleep(60)  # Wait 1 minute before retrying if there's an error
+
+    def _subtract_months(self, dt: datetime, months: int) -> datetime:
+        year = dt.year
+        month = dt.month - months
+        while month <= 0:
+            month += 12
+            year -= 1
+        return dt.replace(year=year, month=month, day=1, hour=0, minute=0, second=0, microsecond=0)
+
+    def _load_activity_state(self) -> dict:
+        try:
+            if self.activity_state_file.exists():
+                return json.loads(self.activity_state_file.read_text(encoding="utf-8"))
+        except Exception as e:
+            logger.error(f"Failed to load activity check state: {e}")
+        return {}
+
+    def _save_activity_state(self, state: dict):
+        try:
+            self.activity_state_file.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        except Exception as e:
+            logger.error(f"Failed to save activity check state: {e}")
+
+    def _activity_hours_from_session(self, session: dict, now_utc: datetime) -> tuple:
+        connection = session.get("connection_id") or {}
+        callsign = str(connection.get("callsign") or "").strip().upper()
+        start = VatsimClient.parse_session_time(connection.get("start"))
+        end = VatsimClient.parse_session_time(connection.get("end")) or now_utc
+        if not start:
+            return callsign, 0.0, None
+        hours = max((end - start).total_seconds(), 0) / 3600
+        return callsign, hours, start
+
+    async def get_activity_channel(self):
+        channel_id = self.config.ACTIVITY_CHANNEL_ID
+        if not channel_id:
+            logger.error("DISCORD_ACTIVITY_CHANNEL_ID is not set")
+            return None
+        channel = self.get_channel(int(channel_id))
+        if channel:
+            return channel
+        try:
+            return await self.fetch_channel(int(channel_id))
+        except Exception as e:
+            logger.error(f"Failed to resolve activity announcement channel {channel_id}: {e}")
+            return None
+
+    async def send_activity_announcement(self, message: str, channel=None):
+        if channel is None:
+            channel = await self.get_activity_channel()
+        if not channel:
+            logger.error(f"Activity announcement not sent (no channel): {message}")
+            return
+        try:
+            await channel.send(message)
+        except Exception as e:
+            logger.error(f"Failed to send activity announcement: {e}")
+
+    async def run_activity_check(self, force: bool = False):
+        if self.activity_check_running:
+            logger.info("Activity check already in progress, skipping")
+            return
+        self.activity_check_running = True
+        channel = None
+        started = False
+        try:
+            now_local = datetime.now(self.activity_timezone)
+            month_key = now_local.strftime("%Y-%m")
+            state = self._load_activity_state()
+            if not force and state.get("last_run_month") == month_key:
+                logger.info(f"Activity check already completed for {month_key}")
+                return
+
+            channel = await self.get_activity_channel()
+            if not channel:
+                logger.error("Cannot start activity check without DISCORD_ACTIVITY_CHANNEL_ID")
+                return
+
+            logger.info("Starting monthly controller activity check...")
+            self.callsigns = self.load_callsigns("callsigns.txt")
+            self.callsign_set = {cs.upper() for cs in self.callsigns}
+            if not self.callsign_set:
+                logger.error("Activity check failed: callsigns.txt is empty or could not be read")
+                return
+            roster_ok = await self.update_roster()
+            if not roster_ok:
+                logger.error("Activity check failed: could not fetch the VATEUD roster")
+                return
+
+            controller_cids = sorted(self.trvac_controllers, key=lambda cid: int(cid) if cid.isdigit() else cid)
+            if not controller_cids:
+                logger.error("Activity check failed: VATEUD roster returned no controller CIDs")
+                return
+
+            await self.send_activity_announcement("Activity check started.", channel)
+            started = True
+
+            window_end = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+            window_start = self._subtract_months(window_end, self.activity_window_months)
+            now_utc = datetime.now(timezone.utc)
+            window_start_utc = window_start.astimezone(timezone.utc)
+            window_end_utc = window_end.astimezone(timezone.utc)
+
+            failed_count = 0
+            for index, cid in enumerate(controller_cids, start=1):
+                sessions = await self.vatsim_client.get_atc_sessions_since(cid, window_start)
+                six_month_hours = 0.0
+                for session in sessions:
+                    callsign, hours, start = self._activity_hours_from_session(session, now_utc)
+                    if not callsign or callsign not in self.callsign_set or not start:
+                        continue
+                    if window_start_utc <= start < window_end_utc:
+                        six_month_hours += hours
+
+                six_month_hours = round(six_month_hours, 2)
+                if six_month_hours < self.activity_min_hours:
+                    failed_count += 1
+                    await self.send_activity_announcement(
+                        f"CID {cid} activity failed. User connected {six_month_hours:.2f} hours "
+                        f"in 6 months, which is below required.",
+                        channel,
+                    )
+
+                if index % 10 == 0 or index == len(controller_cids):
+                    logger.info(f"Activity check progress: {index}/{len(controller_cids)} controllers")
+
+            self._save_activity_state({
+                "last_run": now_local.isoformat(),
+                "last_run_month": month_key,
+                "checked": len(controller_cids),
+                "below_requirement": failed_count,
+            })
+            logger.info(
+                f"Activity check complete: {len(controller_cids)} controllers, "
+                f"{failed_count} below {self.activity_min_hours}h"
+            )
+        except Exception as e:
+            logger.error(f"Activity check failed: {e}", exc_info=True)
+        finally:
+            if started:
+                await self.send_activity_announcement("Activity check finished.", channel)
+            self.activity_check_running = False
+
+    @tasks.loop(hours=1)
+    async def monthly_activity_check_loop(self):
+        now_local = datetime.now(self.activity_timezone)
+        if now_local.day != 1:
+            return
+        await self.run_activity_check(force=False)
+
+    @monthly_activity_check_loop.before_loop
+    async def before_monthly_activity_check_loop(self):
+        await self.wait_until_ready()
 
     @tasks.loop(minutes=1)
     async def check_vatsim(self):
@@ -387,6 +648,21 @@ class VATTurkBot(commands.Bot):
                 await self.close()
             else:
                 await interaction.response.send_message("Permission denied", ephemeral=True)
+
+        @self.tree.command(
+            name="activitycheck",
+            description="Run the monthly vACC activity check now (owner only)",
+            guild=discord.Object(id=self.config.GUILD_ID),
+        )
+        async def activitycheck(interaction: discord.Interaction):
+            if interaction.user.id != self.config.OWNER_ID:
+                await interaction.response.send_message("Permission denied", ephemeral=True)
+                return
+            if self.activity_check_running:
+                await interaction.response.send_message("An activity check is already running.", ephemeral=True)
+                return
+            await interaction.response.send_message("Starting roster activity check. This may take several minutes.")
+            await self.run_activity_check(force=True)
 
     def extract_cid(self, nickname: str) -> str:
         """Extract CID from nickname formats:
@@ -500,6 +776,7 @@ class VATTurkBot(commands.Bot):
         logger.info("Starting bot tasks...")
         self.check_controller_status.start()
         self.check_vatsim.start()
+        self.monthly_activity_check_loop.start()
         
         # Create task for roster updates
         self.loop.create_task(self.schedule_roster_updates())
