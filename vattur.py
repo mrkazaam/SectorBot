@@ -57,7 +57,6 @@ class Config:
         self.OWNER_ID = int(os.getenv('DISCORD_OWNER_ID'))
         self.VATEUD_API_KEY = os.getenv('VATEUD_API_KEY')
         self.ROSTER_UPDATE_INTERVAL = 3600
-        self.INSTATUS_HEARTBEAT_URL = (os.getenv('INSTATUS_HEARTBEAT_URL') or '').rstrip('/')
         
         if not self.GUILD_ID:
             raise ValueError("GUILD_ID environment variable is not set")
@@ -798,38 +797,6 @@ class VATTurkBot(commands.Bot):
         except Exception as e:
             logger.error(f"Error in check_controller_status: {e}", exc_info=True)
 
-    async def _instatus_signal(self, kind: str) -> None:
-        """Ping Instatus cron/heartbeat. kind is 'ok' or 'fail'. Never log the URL."""
-        base = self.config.INSTATUS_HEARTBEAT_URL
-        if not base:
-            return
-        url = f"{base}/fail" if kind == "fail" else base
-        try:
-            response = await asyncio.to_thread(requests.get, url, timeout=10)
-            if response.status_code >= 400:
-                logger.warning(f"Instatus heartbeat {kind} returned HTTP {response.status_code}")
-            else:
-                logger.debug(f"Instatus heartbeat {kind} succeeded")
-        except Exception as e:
-            logger.warning(f"Instatus heartbeat {kind} failed: {e}")
-
-    @tasks.loop(minutes=1)
-    async def instatus_heartbeat(self):
-        """Tell Instatus the bot is alive only while the Discord session is ready."""
-        if self.is_ready() and not self.is_closed():
-            await self._instatus_signal("ok")
-        else:
-            logger.debug("Skipping Instatus heartbeat: Discord is not ready")
-
-    @instatus_heartbeat.before_loop
-    async def before_instatus_heartbeat(self):
-        await self.wait_until_ready()
-
-    async def close(self):
-        if self.config.INSTATUS_HEARTBEAT_URL:
-            await self._instatus_signal("fail")
-        await super().close()
-
     async def setup_hook(self):
         """Verify permissions and role hierarchy during startup"""
         await self.tree.sync(guild=discord.Object(id=self.config.GUILD_ID))
@@ -862,11 +829,6 @@ class VATTurkBot(commands.Bot):
         logger.info("Starting bot tasks...")
         self.check_controller_status.start()
         self.monthly_activity_check_loop.start()
-        if self.config.INSTATUS_HEARTBEAT_URL:
-            self.instatus_heartbeat.start()
-            logger.info("Instatus heartbeat monitor enabled")
-        else:
-            logger.info("Instatus heartbeat skipped (INSTATUS_HEARTBEAT_URL is not set)")
         # Roster bootstrap starts check_vatsim after the first VATEUD attempt
         self.loop.create_task(self.schedule_roster_updates())
         
