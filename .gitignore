@@ -1,4 +1,4 @@
-# Local runtime files, not part of the repo
+# See INSTALL.md — "Not in the repo (you create these locally)"
 
 # Virtual environment (python3.11 -m venv .venv)
 .venv/
@@ -12,10 +12,10 @@ lib64/
 include/
 pyvenv.cfg
 
-# Secrets. Keep these in vattur.env, not in git.
+# Secrets (copy from vattur.env.example → vattur.env)
 vattur.env
 
-# Application logs and local leftovers (written at runtime in WorkingDirectory)
+# Application logs (written at runtime in WorkingDirectory)
 vattur.log
 vattur.log.*
 activity_check_state.json
