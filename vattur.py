@@ -39,6 +39,10 @@ def setup_logging():
     logger.setLevel(logging.INFO)
     logger.addHandler(file_handler)
     logger.addHandler(console_handler)
+
+    # httpx logs the full Telegram URL, which includes the bot token
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
     
     return logger
 
@@ -69,11 +73,14 @@ class WeatherAPI:
     async def get_weather_data(self, airport_code: str, data_type: str) -> dict:
         url = f"{self.base_url}/{data_type}/{airport_code}/decoded"
         headers = {'X-API-Key': self.api_key}
+
+        def _get():
+            response = requests.get(url, headers=headers, timeout=(10, 20))
+            response.raise_for_status()
+            return response.json()
         
         try:
-            response = requests.get(url, headers=headers)
-            response.raise_for_status()
-            data = response.json()
+            data = await asyncio.to_thread(_get)
             
             if data and "data" in data and len(data["data"]) > 0:
                 return {"success": True, "data": data["data"][0]["raw_text"]}
@@ -87,45 +94,59 @@ class VatsimClient:
     # Stay under 10 VATSIM API v2 requests per minute
     V2_MAX_REQUESTS_PER_MINUTE = 9
     V2_WINDOW_SECONDS = 60.0
+    # (connect, read). A hung socket must not stall the Discord heartbeat.
+    DATA_TIMEOUT = (10, 25)
+    # Both minute-loops share one download instead of fetching twice.
+    DATA_CACHE_SECONDS = 25.0
 
     def __init__(self):
         self.api_url = "https://data.vatsim.net/v3/vatsim-data.json"
         self.atc_history_url = "https://api.vatsim.net/v2/members/{cid}/atc"
         self._v2_request_times = []
         self._v2_lock = asyncio.Lock()
-        
-    async def get_controllers(self) -> list:
+        self._data_lock = asyncio.Lock()
+        self._controllers_cache = None
+
+    def _fetch_controllers_sync(self) -> list:
+        response = requests.get(self.api_url, timeout=self.DATA_TIMEOUT)
+        response.raise_for_status()
+
+        if not response.content:
+            raise ValueError("Empty response received from VATSIM API")
+
         try:
-            response = requests.get(self.api_url)
-            response.raise_for_status()  # This will raise an exception for bad status codes
-            
-            # Check if response content is empty
-            if not response.content:
-                logger.error("Empty response received from VATSIM API")
-                return []
-            
-            # Try to parse JSON and handle potential parsing errors
+            data = response.json()
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Failed to parse VATSIM API response: {e}") from e
+
+        controllers = data.get("controllers")
+        if controllers is None:
+            raise ValueError("No 'controllers' key in VATSIM API response")
+        return controllers
+
+    async def get_controllers(self) -> list:
+        now = time.monotonic()
+        cached = self._controllers_cache
+        if cached is not None and now - cached[0] < self.DATA_CACHE_SECONDS:
+            return cached[1]
+
+        async with self._data_lock:
+            now = time.monotonic()
+            cached = self._controllers_cache
+            if cached is not None and now - cached[0] < self.DATA_CACHE_SECONDS:
+                return cached[1]
+
             try:
-                data = response.json()
-            except json.JSONDecodeError as e:
-                logger.error(f"Failed to parse VATSIM API response: {e}")
-                logger.debug(f"Raw response: {response.text[:200]}...")  # Log first 200 chars of response
+                controllers = await asyncio.to_thread(self._fetch_controllers_sync)
+            except (requests.RequestException, ValueError) as e:
+                logger.error(f"Failed to fetch VATSIM data: {e}")
                 return []
-            
-            # Check if controllers key exists
-            controllers = data.get("controllers")
-            if controllers is None:
-                logger.error("No 'controllers' key in VATSIM API response")
+            except Exception as e:
+                logger.error(f"Unexpected error in get_controllers: {e}")
                 return []
-                
+
+            self._controllers_cache = (time.monotonic(), controllers)
             return controllers
-            
-        except requests.RequestException as e:
-            logger.error(f"Failed to fetch VATSIM data: {e}")
-            return []
-        except Exception as e:
-            logger.error(f"Unexpected error in get_controllers: {e}")
-            return []
 
     @staticmethod
     def parse_session_time(value: str):
@@ -284,7 +305,7 @@ class RosterClient:
 
 class VATTurkBot(commands.Bot):
     def __init__(self, config):
-        self.CONTROLLER_ROLE_ID = 1326978814131048489  # "Online ATC" role
+        self.CONTROLLER_ROLE_ID = 1545436417822298192  # "Online ATC" role
         self.role_error_logged = {}
         self.startup_complete = False
         
@@ -295,6 +316,11 @@ class VATTurkBot(commands.Bot):
         intents.guild_messages = True
         intents.members = True  # Need this to access member nicknames
         
+        # This bot never joins voice. Silence discord.py's missing-library warnings.
+        from discord.voice_client import VoiceClient
+        VoiceClient.warn_dave = False
+        VoiceClient.warn_nacl = False
+
         super().__init__(command_prefix="!", intents=intents)
         
         self.config = config
@@ -361,7 +387,7 @@ class VATTurkBot(commands.Bot):
                         text=telegram_message,
                         parse_mode='HTML'
                     )
-                    logger.info(f"HTTP Request: POST https://api.telegram.org/bot{self.config.TELEGRAM_TOKEN}/sendMessage \"HTTP/1.1 200 OK\"")
+                    logger.info("Telegram notification sent")
                     break  # Success, exit retry loop
                     
                 except telegram.error.TimedOut:
